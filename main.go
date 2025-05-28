@@ -1,102 +1,118 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url" // For joining URL paths
 	"os"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
-type Article struct {
-	Title       string
-	PublishDate string
-	Author      string
-	Content     []string
-	Links       []string
+type QuoteItem struct {
+	Text   string   `json:"text"`
+	Author string   `json:"author"`
+	Tags   []string `json:"tags"`
 }
 
-func scrapeLocalFile(filePath string) error {
-	htmlContentBytes, err := os.ReadFile(filePath)
+// scrapeOneQuotesPage scrapes a single page and returns quotes and the next page URL (if any)
+func scrapeOneQuotesPage(pageURL string) ([]QuoteItem, string, error) {
+	var quotes []QuoteItem
+	var nextPageURL string
+
+	fmt.Printf("Fetching URL: %s\n", pageURL)
+	res, err := http.Get(pageURL)
 	if err != nil {
-		return fmt.Errorf("failed to read HTML file %s: %w", filePath, err)
+		return nil, "", fmt.Errorf("failed to get URL %s: %w", pageURL, err)
 	}
-	htmlContent := string(htmlContentBytes)
+	defer res.Body.Close()
 
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
+	if res.StatusCode != 200 {
+		return nil, "", fmt.Errorf("request to %s failed with status code %d: %s", pageURL, res.StatusCode, res.Status)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		return fmt.Errorf("failed to parse HTML from %s: %w", filePath, err)
+		return nil, "", fmt.Errorf("failed to parse HTML from %s: %w", pageURL, err)
 	}
 
-	pageTitle := strings.TrimSpace(doc.Find("head title").First().Text())
-	fmt.Printf("Page Title: %s\n", pageTitle)
-
-	mainHeading := strings.TrimSpace(doc.Find("h1#pageHeader").First().Text())
-	fmt.Printf("Main Heading: %s\n\n", mainHeading)
-
-	fmt.Println("Navigation Links:")
-	doc.Find("header nav ul li a.nav-link").Each(func(i int, s *goquery.Selection) {
-		linkText := strings.TrimSpace(s.Text())
-		linkHref, _ := s.Attr("href")
-		fmt.Printf("  - Text: %s, Href: %s\n", linkText, linkHref)
-		if s.HasClass("active") {
-			fmt.Printf("    (This link is active)\n")
-		}
-	})
-	fmt.Println("")
-
-	fmt.Println("Articles:")
-	doc.Find("article.post").Each(func(i int, articleSelection *goquery.Selection) {
-		var currentArticle Article
-
-		currentArticle.Title = strings.TrimSpace(articleSelection.Find("h2.post-title").First().Text())
-		currentArticle.PublishDate = strings.TrimSpace(articleSelection.Find("p.post-meta span.date").First().Text())
-		currentArticle.Author = strings.TrimSpace(articleSelection.Find("p.post-meta span.author").First().Text())
-
-		articleSelection.Find("div.post-content p").Each(func(j int, pSelection *goquery.Selection) {
-			currentArticle.Content = append(currentArticle.Content, strings.TrimSpace(pSelection.Text()))
+	doc.Find("div.quote").Each(func(i int, s *goquery.Selection) {
+		var currentQuote QuoteItem
+		currentQuote.Text = strings.TrimSpace(s.Find("span.text").First().Text())
+		currentQuote.Author = strings.TrimSpace(s.Find("small.author").First().Text())
+		s.Find("div.tags a.tag").Each(func(j int, tagSelection *goquery.Selection) {
+			currentQuote.Tags = append(currentQuote.Tags, strings.TrimSpace(tagSelection.Text()))
 		})
-
-		articleSelection.Find("div.post-content a").Each(func(k int, aSelection *goquery.Selection) {
-			link, _ := aSelection.Attr("href")
-			currentArticle.Links = append(currentArticle.Links, link)
-		})
-		
-		fmt.Printf("--- Article %d ---\n", i+1)
-		fmt.Printf("  Title: %s\n", currentArticle.Title)
-		fmt.Printf("  Author: %s\n", currentArticle.Author)
-		fmt.Printf("  Date: %s\n", currentArticle.PublishDate)
-		fmt.Println("  Content Paragraphs:")
-		for _, p := range currentArticle.Content {
-			fmt.Printf("    - %s\n", p)
-		}
-		fmt.Println("  Links in Content:")
-		for _, l := range currentArticle.Links {
-			fmt.Printf("    - %s\n", l)
-		}
-
-		specialData, exists := articleSelection.Find("ul li span[data-id='point3-detail']").Attr("data-id")
-		if exists {
-			fmt.Printf("  Special Data Attribute: %s\n", specialData)
-		}
-		fmt.Println("------------------")
+		quotes = append(quotes, currentQuote)
 	})
+	fmt.Printf("Found %d quotes on this page.\n", len(quotes))
 
-	copyrightText := strings.TrimSpace(doc.Find("footer p#copyright").First().Text())
-	fmt.Printf("\nFooter Copyright: %s\n", copyrightText)
+	// Find the "Next" page link
+	// Common selector for the next page link: "li.next a"
+	nextPageRelativePath, exists := doc.Find("li.next a").First().Attr("href")
+	if exists {
+		// Resolve the relative path to an absolute URL
+		base, _ := url.Parse(pageURL) // Use the current pageURL as the base
+		nextPageRef, _ := url.Parse(nextPageRelativePath)
+		nextPageURL = base.ResolveReference(nextPageRef).String()
+		fmt.Printf("Found next page link: %s\n", nextPageURL)
+	} else {
+		fmt.Println("No next page link found.")
+	}
 
-	return nil
+	return quotes, nextPageURL, nil
 }
 
 func main() {
-	filePath := "test.html"
-	fmt.Printf("Attempting to scrape local file: %s\n", filePath)
+	startURL := "http://quotes.toscrape.com/"
+	outputQuotesJsonPath := "all_quotes.json"
+	var allQuotes []QuoteItem
+	currentURL := startURL
+	maxPages := 5 // Let's limit to 5 pages for now to be polite
 
-	err := scrapeLocalFile(filePath)
-	if err != nil {
-		log.Fatalf("Scraping failed: %v", err)
+	fmt.Printf("Starting to scrape quotes, max %d pages...\n", maxPages)
+
+	for i := 0; i < maxPages; i++ {
+		if currentURL == "" {
+			fmt.Println("No more pages to scrape.")
+			break
+		}
+		fmt.Printf("\nScraping page %d: %s\n", i+1, currentURL)
+		
+		quotesFromPage, nextPageURL, err := scrapeOneQuotesPage(currentURL)
+		if err != nil {
+			log.Printf("Failed to scrape page %s: %v. Stopping.", currentURL, err)
+			break // Stop if a page fails
+		}
+
+		allQuotes = append(allQuotes, quotesFromPage...)
+		currentURL = nextPageURL // Prepare for the next iteration
+
+		if currentURL == "" && i < maxPages-1 { // No next page, but we haven't hit maxPages
+		    fmt.Println("Reached the last page of quotes.")
+		    break
+		}
+	}
+	
+	fmt.Printf("\nTotal quotes scraped: %d\n", len(allQuotes))
+
+	if len(allQuotes) > 0 {
+		jsonData, err := json.MarshalIndent(allQuotes, "", "  ")
+		if err != nil {
+			log.Fatalf("Failed to marshal all quotes to JSON: %v", err)
+		}
+
+		err = os.WriteFile(outputQuotesJsonPath, jsonData, 0644)
+		if err != nil {
+			log.Fatalf("Failed to write JSON data to %s: %v", outputQuotesJsonPath, err)
+		}
+		fmt.Printf("Successfully scraped quote data saved to %s\n", outputQuotesJsonPath)
+	} else {
+		fmt.Println("No quotes found to save.")
 	}
 
-	fmt.Println("\nSuccessfully finished scraping local file.")
+	fmt.Println("All quotes scraping process complete.")
 }
